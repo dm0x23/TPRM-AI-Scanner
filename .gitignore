@@ -9,6 +9,8 @@ uploads/
 reports/
 output/
 outputs/
+input/
+inputs/
 parity_report/
 *.ipynb
 
