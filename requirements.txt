@@ -1,0 +1,11 @@
+pandas
+openpyxl
+requests
+beautifulsoup4
+transformers
+accelerate
+torch
+numpy
+urllib3
+streamlit
+pytest
