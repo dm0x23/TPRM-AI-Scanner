@@ -6,6 +6,9 @@
 
 An automated, end-to-end data pipeline engineered for Third-Party Risk Management (TPRM). This system performs zero-touch vendor due diligence by crawling a vendor's public digital footprint, utilizing local Natural Language Processing (NLP) to detect "Shadow AI" usage, and outputting an actuarial cybersecurity risk score based on deterministic risk matrices.
 
+<img width="1098" height="592" alt="optiv-architecture-diagram" src="https://github.com/user-attachments/assets/0ad60461-b990-4a8a-8eec-bddc99170850" />
+<img width="2863" height="556" alt="optiv" src="https://github.com/user-attachments/assets/b5be08ca-f62b-49f5-9c25-295d93cc27ba" />
+
 ---
 
 ## 📊 System Architecture & Data Flow
