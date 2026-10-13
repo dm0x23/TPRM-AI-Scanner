@@ -10,10 +10,6 @@ An automated, end-to-end data pipeline engineered for Third-Party Risk Managemen
 
 ## 📊 System Architecture & Data Flow
 
-*(Place your minimal functional design diagram here. Save the image as `architecture.png` in a `docs/` folder and it will render below.)*
-
-![Pipeline Architecture](docs/architecture.png)
-
 The system operates on a linear, feed-forward design, passing data seamlessly in-memory via Pandas DataFrames to eliminate intermediate I/O bottlenecks.
 
 ### Core Processing Stages
@@ -48,8 +44,8 @@ The system operates on a linear, feed-forward design, passing data seamlessly in
 1. **Clone the repository:**
 
    ```bash
-   git clone https://github.com/[YOUR-USERNAME]/[YOUR-REPO-NAME].git
-   cd [YOUR-REPO-NAME]
+   git clone https://github.com/dm0x23/TPRM-AI-Scanner.git
+   cd TPRM-AI-Scanner
    ```
 
 2. **Install dependencies:**
@@ -124,4 +120,3 @@ We strictly enforce modular code ownership to prevent merge conflicts and pipeli
 
 * Do not modify `src/pipeline.py` without team consensus.
 * **Never commit output `.xlsx` files** or cache directories to version control.
-*

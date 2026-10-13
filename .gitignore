@@ -1,0 +1,39 @@
+# --- Vendor data & generated reports: NEVER commit these ---
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.tsv
+data/
+uploads/
+reports/
+output/
+outputs/
+parity_report/
+*.ipynb
+
+# --- Credentials & secrets ---
+.env
+.env.*
+*.pem
+*.key
+*.p12
+secrets.toml
+.streamlit/secrets.toml
+credentials*.json
+service-account*.json
+
+# --- Python ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
