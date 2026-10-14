@@ -1,9 +1,9 @@
 """Stage 2 - public website / OSINT scraping and keyword AI-signal detection.
 
-GENERATED FROM optiv.ipynb, cell 3. The code below the import block is the
-notebook code unchanged. Do not edit scoring rules, thresholds or model settings here
-without updating the notebook too: tools/verify_parity.py checks that this module and the
-notebook produce identical outputs.
+Originally generated from optiv.ipynb, cell 3. Collection depth and evidence rules
+are retained. HTTP fetching now supports concurrent hosts, shared per-host pacing,
+and per-run short-circuiting after repeated connection failures to an origin that
+has never responded. Strict source parity will report these performance changes.
 """
 # --- import block: notebook cell 1, unchanged ---
 import argparse
@@ -18,6 +18,7 @@ import re
 import socket
 import sys
 import time
+import threading
 import unicodedata
 import warnings
 from dataclasses import dataclass, field
@@ -200,29 +201,62 @@ class Fetched:
 
 class Fetcher:
     def __init__(self, contact: str | None = None, delay: float = 1.0, timeout: int = 15,
-                 respect_robots: bool = True):
+                 respect_robots: bool = True, max_connection_failures: int = 2):
         ua = "VendorAIOSINT/1.0 (academic third-party-risk case study" + (f"; contact: {contact})" if contact else ")")
-        self.s = requests.Session()
-        self.s.headers.update({"User-Agent": ua, "Accept-Language": "en"})
-        retry_kw = dict(total=2, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504),
-                        respect_retry_after_header=True)
-        try:
-            retry = Retry(allowed_methods=("GET",), **retry_kw)
-        except TypeError:  # urllib3 < 1.26 calls it method_whitelist
-            retry = Retry(method_whitelist=("GET",), **retry_kw)
-        self.s.mount("http://", HTTPAdapter(max_retries=retry))
-        self.s.mount("https://", HTTPAdapter(max_retries=retry))
+        self._local = threading.local()
+        self._state_lock = threading.Lock()
+        self._host_locks = {}
+        self._sessions = []
+        # Each failed get already exhausts the configured transport retries.
+        # Stop repeated probes only if this origin has NEVER responded this run.
+        self.max_connection_failures = max_connection_failures
+        self._connection_failures = {}
+        self._responsive_origins = set()
+        self._user_agent = ua
         self.delay, self.timeout, self.respect_robots = delay, timeout, respect_robots
         self._last: dict[str, float] = {}
         self._robots: dict[str, robotparser.RobotFileParser | None] = {}
         self._cache: dict[str, Fetched] = {}
         self.log: list[dict] = []
 
+    @property
+    def s(self):
+        # requests.Session is mutable; each worker owns its connection pool.
+        if not hasattr(self._local, "session"):
+            session = requests.Session()
+            session.headers.update({"User-Agent": self._user_agent, "Accept-Language": "en"})
+            retry_kw = dict(total=2, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504),
+                            respect_retry_after_header=True)
+            try:
+                retry = Retry(allowed_methods=("GET",), **retry_kw)
+            except TypeError:  # urllib3 < 1.26 calls it method_whitelist
+                retry = Retry(method_whitelist=("GET",), **retry_kw)
+            session.mount("http://", HTTPAdapter(max_retries=retry))
+            session.mount("https://", HTTPAdapter(max_retries=retry))
+            self._local.session = session
+            with self._state_lock:
+                self._sessions.append(session)
+        return self._local.session
+
+    def close(self):
+        for session in self._sessions:
+            session.close()
+        self._sessions.clear()
+
+    def get(self, url: str, **kwargs) -> Fetched:
+        # Same-host requests share pacing and cache protection across vendors.
+        # Keep the lock through retries, so an overloaded host isn't hammered.
+        host = urlparse(url).netloc
+        with self._state_lock:
+            lock = self._host_locks.setdefault(host, threading.RLock())
+        with lock:
+            return self._get(url, **kwargs)
+
     def _wait(self, host):
-        gap = time.time() - self._last.get(host, 0)
+        gap = time.monotonic() - self._last.get(host, 0)
         if gap < self.delay:
             time.sleep(self.delay - gap)
-        self._last[host] = time.time()
+        self._last[host] = time.monotonic()
 
     def robots_allows(self, url: str) -> bool:
         if not self.respect_robots:
@@ -234,6 +268,7 @@ class Fetcher:
             try:
                 self._wait(u.netloc)
                 r = self.s.get(base + "/robots.txt", timeout=self.timeout)
+                self._responsive_origins.add(base)
                 rp.parse(r.text.splitlines() if r.status_code == 200 else [])
                 self._robots[base] = rp
             except requests.RequestException:
@@ -245,16 +280,21 @@ class Fetcher:
         rp = self._robots.get(base)
         return list(rp.site_maps() or []) if rp is not None and hasattr(rp, "site_maps") else []
 
-    def get(self, url: str, *, robots: bool = True, max_bytes: int = 3_000_000, headers=None) -> Fetched:
+    def _get(self, url: str, *, robots: bool = True, max_bytes: int = 3_000_000, headers=None) -> Fetched:
         url, _ = urldefrag(url)
         if url in self._cache:
             return self._cache[url]
-        if robots and not self.robots_allows(url):
+        origin = origin_of(url)
+        if (self.max_connection_failures > 0 and origin not in self._responsive_origins
+                and self._connection_failures.get(origin, 0) >= self.max_connection_failures):
+            f = Fetched(url, -1, note="host_unreachable_after_repeated_connection_failures")
+        elif robots and not self.robots_allows(url):
             f = Fetched(url, 0, note="blocked_by_robots_txt")
         else:
             try:
                 self._wait(urlparse(url).netloc)
                 r = self.s.get(url, timeout=self.timeout, stream=True, headers=headers or {})
+                self._responsive_origins.add(origin)
                 try:
                     ctype = r.headers.get("Content-Type", "")
                     if r.status_code == 200 and not re.search(r"html|xml|json|text", ctype, re.I):
@@ -278,9 +318,11 @@ class Fetcher:
                 finally:
                     r.close()  # stream=True: always release the connection
             except (requests.RequestException, ValueError) as e:
+                if isinstance(e, (requests.ConnectionError, requests.ConnectTimeout)):
+                    self._connection_failures[origin] = self._connection_failures.get(origin, 0) + 1
                 f = Fetched(url, -1, note=f"request_error:{type(e).__name__}")
         self._cache[url] = f
-        self.log.append({"url": url, "status": f.status, "note": f.note, "at": now_iso()})
+        self.log.append({"url": url, "status": f.status, "note": f.note, "at": now_iso(), "thread_id": threading.get_ident()})
         return f
 
 
@@ -619,6 +661,7 @@ def scrape_vendor(vendor_id: str, name: str, website: str, level: int = 2, conta
         raise ValueError(f"level {level} not defined; available: {sorted(levels)}")
     cfg = levels[level]
     f = fetcher or Fetcher(contact=contact)
+    log_start = len(f.log)
     base = norm_url(website)
     res = Result(vendor_id, name, base, level, cfg["label"])
     ov = (overrides or {}).get(vendor_id, {})
@@ -648,4 +691,5 @@ def scrape_vendor(vendor_id: str, name: str, website: str, level: int = 2, conta
     }
     res.meta["finished_at"] = now_iso()
     return {"meta": res.meta, "summary": summary, "evidence": ev,
-            "sources_checked": res.checked, "fetch_log": f.log[-400:]}
+            "sources_checked": res.checked, "fetch_log": [{k: v for k, v in entry.items() if k != "thread_id"}
+                          for entry in f.log[log_start:] if entry.get("thread_id", threading.get_ident()) == threading.get_ident()][-400:]}

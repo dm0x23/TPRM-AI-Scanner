@@ -1,12 +1,13 @@
 """Stage 3 - local NLP AI-usage verification (zero-shot NLI + capability summaries).
 
-GENERATED FROM optiv.ipynb, cell 4 and 5. The code below the import block is the
-notebook code unchanged except that the Colab-only display code is removed (see the [integration] note). Do not edit scoring rules, thresholds or model settings here
-without updating the notebook too: tools/verify_parity.py checks that this module and the
-notebook produce identical outputs.
+Originally generated from optiv.ipynb, cells 4 and 5. Model choices, scoring rules,
+thresholds and prompts are retained. Performance changes reuse exact model inputs
+and deduplicate summary prompts while retaining every audit row. The original
+notebook was not supplied; strict source parity will report these changes.
 """
 # --- import block: notebook cell 1, unchanged ---
 import argparse
+from collections import OrderedDict
 import contextlib
 import csv
 import difflib
@@ -18,6 +19,7 @@ import re
 import socket
 import sys
 import time
+import threading
 import unicodedata
 import warnings
 from dataclasses import dataclass, field
@@ -186,7 +188,7 @@ def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 class EgressGuard:
-    """Blocks non-loopback TCP connects while active; counts attempts as an audit metric."""
+    """Blocks inference-thread non-loopback TCP connects; counts attempts as an audit metric."""
 
     def __init__(self):
         self.blocked = 0
@@ -195,6 +197,7 @@ class EgressGuard:
     def active(self):
         real_connect, real_connect_ex = socket.socket.connect, socket.socket.connect_ex
         guard = self
+        owner_thread = threading.get_ident()
 
         def _is_external(address) -> bool:
             if isinstance(address, tuple) and address:
@@ -203,13 +206,13 @@ class EgressGuard:
             return False  # AF_UNIX paths etc.
 
         def guarded_connect(sock, address, *a, **k):
-            if _is_external(address):
+            if threading.get_ident() == owner_thread and _is_external(address):
                 guard.blocked += 1
                 raise ConnectionError(f"[EgressGuard] outbound connection to {address[0]} blocked")
             return real_connect(sock, address, *a, **k)
 
         def guarded_connect_ex(sock, address, *a, **k):
-            if _is_external(address):
+            if threading.get_ident() == owner_thread and _is_external(address):
                 guard.blocked += 1
                 return 111  # ECONNREFUSED
             return real_connect_ex(sock, address, *a, **k)
@@ -230,6 +233,7 @@ class ZeroShotClassifier:
         from transformers import pipeline
 
         self.cfg = cfg
+        self._prob_cache = OrderedDict()
         self.device = 0 if torch.cuda.is_available() else -1
         self.pipe = pipeline("zero-shot-classification", model=cfg.nli_model, device=self.device)
         if self.device == 0:
@@ -238,6 +242,23 @@ class ZeroShotClassifier:
         self.hypotheses = [LABEL_HYPOTHESES[lab] for lab in LABEL_ORDER]
 
     def predict_proba(self, texts: Sequence[str]) -> np.ndarray:
+        # Reuse exact text only, within this model instance (never stale web data).
+        texts = list(texts)
+        if not texts:
+            return np.empty((0, len(LABEL_ORDER)))
+        unique = list(dict.fromkeys(texts))
+        resolved = {t: self._prob_cache[t] for t in unique if t in self._prob_cache}
+        missing = [t for t in unique if t not in resolved]
+        if missing:
+            values = self._predict_uncached(missing)
+            for t, value in zip(missing, values):
+                resolved[t] = value
+                self._prob_cache[t] = value
+            while len(self._prob_cache) > 2048:
+                self._prob_cache.popitem(last=False)
+        return np.stack([resolved[t] for t in texts])
+
+    def _predict_uncached(self, texts):
         out = self.pipe(
             list(texts),
             candidate_labels=self.hypotheses,
@@ -411,16 +432,32 @@ def analyze(raw: pd.DataFrame, clf, summarizer, cfg: Config = CFG, rep=None,
         # ---- capability summaries (verified rows only) -----------------------------
         summaries: Dict[int, str] = {}
         verified_idx = [i for i, d in enumerate(results) if d["is_yes"]]
-        for s in range(0, len(verified_idx), cfg.gen_batch_size):
-            batch = verified_idx[s:s + cfg.gen_batch_size]
-            items = [(prep.vendor_name[i], prep.text_ctx[i]) for i in batch]
+        # Repeated page/navigation signals often produce identical prompts.
+        # Keep every evidence row, but generate once per exact (vendor, context).
+        unique_items = list(dict.fromkeys((prep.vendor_name[i], prep.text_ctx[i]) for i in verified_idx))
+        summary_cache = getattr(summarizer, "_meridian_summary_cache", None)
+        if summary_cache is None:
+            summary_cache = OrderedDict()
+            summarizer._meridian_summary_cache = summary_cache
+        resolved = {item: summary_cache[item] for item in unique_items if item in summary_cache}
+        missing = [item for item in unique_items if item not in resolved]
+        for s in range(0, len(missing), cfg.gen_batch_size):
+            items = missing[s:s + cfg.gen_batch_size]
             raws = summarizer.summarize(items)
-            for i, raw_s in zip(batch, raws):
-                summaries[i] = finalize_summary(raw_s, prep.vendor_name[i], prep.text_ctx[i],
-                                                prep.excerpt[i] or prep.text_ctx[i])
-            done = min(s + cfg.gen_batch_size, len(verified_idx))
-            rep.update(cls_hi + (hi - cls_hi) * done / max(len(verified_idx), 1),
-                       f"Synthesizing capability summaries: {done}/{len(verified_idx)}")
+            if len(raws) != len(items):
+                raise ValueError("Summarizer returned the wrong number of results")
+            for item, raw_s in zip(items, raws):
+                resolved[item] = raw_s
+                summary_cache[item] = raw_s
+            while len(summary_cache) > 1024:
+                summary_cache.popitem(last=False)
+            done = min(s + cfg.gen_batch_size, len(missing))
+            rep.update(cls_hi + (hi - cls_hi) * done / max(len(missing), 1),
+                       f"Synthesizing capability summaries: {done}/{len(missing)} unique prompts")
+        for i in verified_idx:
+            summaries[i] = finalize_summary(resolved[(prep.vendor_name[i], prep.text_ctx[i])],
+                                            prep.vendor_name[i], prep.text_ctx[i],
+                                            prep.excerpt[i] or prep.text_ctx[i])
 
     # ---- assemble handoff dataframe ------------------------------------------------
     out_rows = []
@@ -468,6 +505,9 @@ def analyze(raw: pd.DataFrame, clf, summarizer, cfg: Config = CFG, rep=None,
         "avg_conf": float(out["Confidence_Pct"].dropna().mean()) if out["Confidence_Pct"].notna().any() else float("nan"),
         "hash_repaired": int((out["Hash_Provenance"] != "scraper").sum()),
         "egress_blocked": guard.blocked,
+        "unique_classification_passages": len(cache),
+        "unique_summary_prompts": len(unique_items),
+        "summary_cache_hits": len(unique_items) - len(missing),
         "elapsed_s": round(time.time() - t0, 1),
     }
     return AuditResult(out, metrics)

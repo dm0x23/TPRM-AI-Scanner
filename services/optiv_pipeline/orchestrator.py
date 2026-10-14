@@ -1,6 +1,6 @@
 """Runs the notebook's ``run_full_pipeline()`` stage by stage, for the Streamlit app.
 
-The assessment logic lives unchanged in criticality.py, scraper.py, nlp_engine.py and
+The assessment rules live in criticality.py, scraper.py, nlp_engine.py and
 risk.py (generated from optiv.ipynb). This file only reproduces the *orchestration*
 from notebook cell 6 (``run_full_pipeline``), with the technical changes needed to run
 outside Colab. Every change is listed here and tagged ``[integration]`` in the code.
@@ -23,6 +23,8 @@ T6  Output columns are matched to the sheet's headers ignoring case, spacing and
     wrote the date to 'Assessedd By / Date' (typo). If the sheet has a column with
     that name, or one named 'Assessed By / Date', the date goes there; otherwise the
     notebook's 'Assessedd By / Date' column is created.
+T7  Vendors scrape concurrently (default 4), with main-thread callbacks, ordered
+    results, per-host pacing, exact-input NLP caches and per-stage timings.
 
 Methodology deviations (each can be switched off with a flag below)
 -------------------------------------------------------------------
@@ -48,6 +50,9 @@ from __future__ import annotations
 import functools
 import os
 import re
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
@@ -125,6 +130,7 @@ class PipelineRun:
     column_mapping: Dict[str, str]
     warnings: List[str]
     nlp_error: Optional[str] = None
+    stage_timings: Dict[str, float] = field(default_factory=dict)
     contact_used: bool = False
 
 
@@ -171,6 +177,9 @@ def _blank(v) -> bool:
     return v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == ""
 
 
+_MODEL_LOCK = threading.RLock()
+
+
 @functools.lru_cache(maxsize=1)
 def _load_models():
     # [integration T5] loaded once; same classes and CFG as the notebook
@@ -178,7 +187,8 @@ def _load_models():
 
 
 def default_model_factory():
-    return _load_models()
+    with _MODEL_LOCK:
+        return _load_models()
 
 
 def _coverage(result: dict) -> int:
@@ -217,18 +227,31 @@ def run_pipeline(
     model_factory: Optional[Callable[[], tuple]] = None,
     scrape_fn: Optional[Callable[..., dict]] = None,
     fetcher_factory: Optional[Callable[[Optional[str]], object]] = None,
+    scrape_workers: Optional[int] = None,
 ) -> PipelineRun:
     """Run the Meridian assessment on one worksheet.
 
     ``sheet_df`` is the selected worksheet with its header row applied, including
     columns that are empty (so the completed template keeps the sheet's layout).
     ``model_factory`` / ``scrape_fn`` / ``fetcher_factory`` exist so tests can inject
-    replayed scrape results or stand-in models; the app uses the defaults.
+    replayed scrape results or stand-in models; the app uses the defaults. Injected
+    fetchers must support concurrent get() calls, or set scrape_workers=1. The caller
+    owns injected fetcher cleanup. scrape_workers defaults to MERIDIAN_SCRAPE_WORKERS
+    (4); progress callbacks always run on the calling thread.
     """
     def report(frac, msg):
         if progress:
             progress(frac, msg)
 
+    started = time.perf_counter()
+    stage_timings = {}
+    try:
+        workers = int(scrape_workers if scrape_workers is not None else
+                      os.getenv("MERIDIAN_SCRAPE_WORKERS", "4"))
+    except (TypeError, ValueError) as exc:
+        raise PipelineInputError("Scrape workers must be an integer between 1 and 16") from exc
+    if not 1 <= workers <= 16:
+        raise PipelineInputError("Scrape workers must be between 1 and 16")
     warnings_: List[str] = []
     contact = (contact_email or os.getenv(CONTACT_ENV_VAR) or "").strip() or None   # [integration T2]
     scrape_fn = scrape_fn or scr.scrape_vendor
@@ -257,32 +280,52 @@ def run_pipeline(
                          + ". Results are merged by Vendor ID, so these rows share one result.")
 
     # ---------------- 2. Scraping (notebook step 2) ----------------------------
+    stage_timings["criticality_s"] = time.perf_counter() - started
+    scrape_started = time.perf_counter()
     fetcher = (fetcher_factory or (lambda c: scr.Fetcher(contact=c)))(contact)
     statuses: Dict[str, VendorStatus] = {}
     scraper_results: List[dict] = []
     rows = crit_df.to_dict(orient="records")
-    for i, row in enumerate(rows):
-        vid, name, site = str(row["Vendor ID"]), row["Vendor Name"], row["Public Website"]
-        st_ = statuses.setdefault(vid, VendorStatus(vid, "" if _blank(name) else str(name)))
-        report(0.05 + 0.50 * i / max(len(rows), 1),
-               f"2/5 Scraping {i + 1}/{len(rows)}: {st_.vendor_name or vid} "
-               f"(depth {int(row['Criticality'])} - {row['Criticality Level']})")
-        if _blank(vid):
-            st_.status, st_.reason = "Incomplete", "Vendor ID is blank"
-            continue
-        try:
-            result = scrape_fn(
-                vendor_id=str(row["Vendor ID"]),
-                name=str(row["Vendor Name"]),
-                website=str(row["Public Website"]),
-                level=int(row["Criticality"]),
-                contact=contact,
-                fetcher=fetcher,
-            )
-        except Exception as exc:   # [integration T4]
-            st_.status = "Incomplete"
-            st_.reason = f"Scrape could not start: {type(exc).__name__}: {exc}"
-            continue
+    def scrape_one(row):
+        return scrape_fn(
+            vendor_id=str(row["Vendor ID"]), name=str(row["Vendor Name"]),
+            website=str(row["Public Website"]), level=int(row["Criticality"]),
+            contact=contact, fetcher=fetcher)
+
+    # Only the main thread mutates statuses and invokes Streamlit callbacks.
+    ordered_results = {}
+    try:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meridian-scrape") as pool:
+            pending = {}
+            for i, row in enumerate(rows):
+                vid, name = str(row["Vendor ID"]), row["Vendor Name"]
+                st_ = statuses.setdefault(vid, VendorStatus(vid, "" if _blank(name) else str(name)))
+                if _blank(vid):
+                    st_.status, st_.reason = "Incomplete", "Vendor ID is blank"
+                    continue
+                if _blank(name) or _blank(row["Public Website"]):
+                    st_.status, st_.reason = "Incomplete", "Vendor name or public website is blank"
+                    continue
+                pending[pool.submit(scrape_one, row)] = (i, vid)
+            report(0.05, f"2/5 Scraping {len(pending)} vendors with {workers} workers…")
+            for done, future in enumerate(as_completed(pending), 1):
+                i, vid = pending[future]
+                st_ = statuses[vid]
+                try:
+                    ordered_results[i] = future.result()
+                except Exception as exc:
+                    st_.status = "Incomplete"
+                    st_.reason = f"Scrape could not start: {type(exc).__name__}: {exc}"
+                report(0.05 + 0.50 * done / max(len(pending), 1),
+                       f"2/5 Scraped {done}/{len(pending)}: {st_.vendor_name or vid}")
+    finally:
+        if fetcher_factory is None:
+            fetcher.close()
+
+    # Restore worksheet order: completion order must not alter tie-breaking.
+    for i in sorted(ordered_results):
+        result = ordered_results[i]
+        st_ = statuses[str(rows[i]["Vendor ID"])]
         scraper_results.append(result)
         st_.evidence_rows += len(result.get("evidence", []))
         st_.first_party_pages_read += _coverage(result)
@@ -292,11 +335,14 @@ def run_pipeline(
             if n.get("outcome") == "thin_content":
                 st_.notes.append(f"thin content at {n.get('target')} (may be JavaScript-rendered)")
 
+    stage_timings["scraping_s"] = time.perf_counter() - scrape_started
+
     # ---------------- 3. Flatten (notebook step 3) -----------------------------
     report(0.55, "3/5 Formatting evidence for the NLP engine…")
     evidence_df = risk_mod.flatten_scraper_evidence(scraper_results)
 
     # ---------------- 4. NLP (notebook step 4) ---------------------------------
+    nlp_started = time.perf_counter()
     nlp_df, metrics, nlp_error = None, {}, None
     if evidence_df.empty:
         warnings_.append("No AI keyword evidence was found for any vendor; the NLP stage was skipped. "
@@ -304,9 +350,13 @@ def run_pipeline(
     else:
         try:
             report(0.57, f"4/5 Loading NLP models ({nlp.CFG.nli_model}, {nlp.CFG.gen_model})…")
-            clf, summ = model_factory()
-            audit = nlp.analyze(raw=evidence_df, clf=clf, summarizer=summ, cfg=nlp.CFG,
-                                rep=_Reporter(progress, 0.60, 0.95))
+            # Models and EgressGuard modify process-wide state; serialize NLP runs.
+            with _MODEL_LOCK:
+                load_started = time.perf_counter()
+                clf, summ = model_factory()
+                stage_timings["model_loading_s"] = time.perf_counter() - load_started
+                audit = nlp.analyze(raw=evidence_df, clf=clf, summarizer=summ, cfg=nlp.CFG,
+                                    rep=_Reporter(progress, 0.60, 0.95))
             nlp_df, metrics = audit.df, audit.metrics
         except Exception as exc:   # [integration D2]
             nlp_error = f"{type(exc).__name__}: {exc}"
@@ -316,6 +366,8 @@ def run_pipeline(
                 raise
     if nlp_df is None:
         nlp_df = pd.DataFrame(columns=_NLP_COLUMNS)
+
+    stage_timings["nlp_s"] = time.perf_counter() - nlp_started
 
     # ---------------- 5. Aggregate + risk (notebook step 5, unchanged) ---------
     report(0.96, "5/5 Aggregating results and applying the risk matrix…")
@@ -431,14 +483,15 @@ def run_pipeline(
                     value = NOT_ASSESSED_TIER_TEXT
                 export_df.at[idx, dst] = value
 
-    report(1.0, "Assessment complete")
+    stage_timings["total_s"] = time.perf_counter() - started
+    report(1.0, f"Assessment complete in {stage_timings['total_s']:.1f}s")
     return PipelineRun(
         crit_df=crit_df, scraper_results=scraper_results, evidence_df=evidence_df, nlp_df=nlp_df,
         nlp_metrics=metrics, final_df=final_df, export_df=export_df.reset_index(drop=True),
         vendor_status=statuses, v000_comparison=v000_cmp,
         column_mapping={**{f"input: {k}": (v or "MISSING") for k, v in mapping.items()},
                         **{f"output: {k}": v for k, v in export_cols.items()}},
-        warnings=warnings_, nlp_error=nlp_error, contact_used=bool(contact),
+        warnings=warnings_, nlp_error=nlp_error, stage_timings=stage_timings, contact_used=bool(contact),
     )
 
 

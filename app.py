@@ -144,6 +144,13 @@ def render_run_details(run) -> None:
     } for s in run.vendor_status.values()])
     with st.expander("Assessment completeness per vendor", expanded=bool((status["Status"] != "Complete").any())):
         st.dataframe(status, hide_index=True)
+        if run.stage_timings:
+            st.caption("Timing: " + " · ".join(
+                f"{label}: {run.stage_timings[key]:.1f}s"
+                for key, label in [("scraping_s", "Web collection"),
+                                   ("model_loading_s", "Model loading"),
+                                   ("nlp_s", "NLP including loading"), ("total_s", "Total")]
+                if key in run.stage_timings))
         m = run.nlp_metrics
         if m:
             st.caption(f"NLP: {m.get('total')} evidence rows scored · {m.get('verified')} verified embedded AI · "
