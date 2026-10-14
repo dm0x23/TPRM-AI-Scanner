@@ -16,24 +16,28 @@ def run_full_pipeline(input_path: str, output_path: str, contact_email: str = ""
     Suitable for both CLI headless execution and Streamlit web UI.
     """
     print(f"[*] Starting Pipeline for input: {input_path}")
-
     # ---------------------------------------------------------
     # STAGE 1: INGESTION & CRITICALITY SCORING
     # ---------------------------------------------------------
     print("[*] Stage 1: Ingesting Vendor Data & Calculating Criticality...")
     try:
-        raw_df = pd.read_excel(input_path)
-        # Smart header detection: If row 0 is instructions, skip down until 'Vendor ID' is found
-        if "Vendor ID" not in raw_df.columns:
-            for i in range(1, 4):
-                temp_df = pd.read_excel(input_path, header=i)
-                if "Vendor ID" in temp_df.columns:
-                    raw_df = temp_df
-                    break
+        # Aggressively scan the first 5 rows to find the true header
+        raw_df = None
+        for i in range(5):
+            temp_df = pd.read_excel(input_path, header=i)
+            # Convert columns to lowercase strings to ignore Excel spacing/formatting
+            clean_cols = [str(c).strip().lower() for c in temp_df.columns]
+            if "vendor id" in clean_cols or "vendor_id" in clean_cols:
+                raw_df = temp_df
+                break
+
+        if raw_df is None:
+            raise ValueError("Could not find a header row containing 'Vendor ID'.")
+
     except Exception as e:
         raise ValueError(f"Failed to read input Excel file: {e}")
 
-    # Apply actuarial scoring (this function handles its own alias resolution internally)
+    # Apply actuarial scoring
     crit_df = assess_criticality(raw_df)
     pipeline_df = crit_df.copy()
 
