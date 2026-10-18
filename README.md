@@ -5,7 +5,7 @@ preview it, view assessment results, and download an Excel report.
 
 > **Status:** the Optiv notebook pipeline (`optiv.ipynb`) is **connected** through
 > `services/optiv_pipeline/`. **Run assessment** runs criticality scoring, live public-website
-> scraping, local NLP AI detection (`facebook/bart-large-mnli` + `Qwen/Qwen2.5-0.5B-Instruct`),
+> scraping, local NLP AI detection (`facebook/bart-large-mnli` + `Qwen/Qwen2.5-0.5B-Instruct`)
 > evidence aggregation, sub-processor extraction and the risk matrix on the selected sheet.
 > Uploading a file on its own still only loads data. **Demo mode** still shows synthetic data
 > labelled `DEMO DATA — NOT REAL FINDINGS` and never runs the pipeline.
